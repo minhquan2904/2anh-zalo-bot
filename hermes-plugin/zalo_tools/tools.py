@@ -14,17 +14,20 @@ hàm dễ làm khoá tài khoản (gửi lời mời kết bạn hàng loạt, c
 nhóm) hoặc chạm tới tiền bạc cố tình bị bỏ ra ngoài.
 """
 
-import contextvars
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import tempfile
+import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,7 @@ TOOLSET_PUBLIC = "zalo_public"
 # cùng tên với nền tảng cho mọi phiên, nên đặt trùng thì người ngoài cũng nhận
 # luôn bộ công cụ dành riêng cho chủ.
 TOOLSET_OWNER = "zalo_owner"
+TOOLSET_DENIED = "zalo_denied"
 # Công cụ chỉ có nghĩa trong lượt chạy cron. Không nằm trong bộ nào
 # toolsets_for_source trả về, nên chat thường không bao giờ thấy.
 TOOLSET_CRON = "zalo_cron"
@@ -70,7 +74,8 @@ _CONFIRMATION_TTL_SECONDS = 300
 def set_turn_context(*, sender_uid: str, thread_id: str, is_group: bool,
                      is_owner: bool, text: str = "", reply_msg_id: str = "",
                      reply_cli_msg_id: str = "", reply_is_own: bool = False,
-                     msg_id: str = "", sender_name: str = "") -> None:
+                     msg_id: str = "", sender_name: str = "", audience: str = "owner",
+                     bridge_verified: bool = False) -> None:
     """Adapter gọi trước khi đẩy tin vào agent.
 
     ``text`` là NGUYÊN VĂN tin nhắn người dùng vừa gõ, chưa qua tay mô hình.
@@ -90,6 +95,8 @@ def set_turn_context(*, sender_uid: str, thread_id: str, is_group: bool,
         "reply_is_own": bool(reply_is_own),
         "msg_id": str(msg_id or ""),
         "sender_name": str(sender_name or ""),
+        "audience": str(audience or ""),
+        "bridge_verified": bool(bridge_verified),
     })
 
 
@@ -107,19 +114,19 @@ def _turn() -> Dict[str, Any]:
     return _TURN.get() or {}
 
 
-def current_authorization(*, confirmed: bool = False) -> Dict[str, Any]:
+def current_authorization(*, confirmed: bool = False):
     """Return the non-model authority envelope attached to a bridge frame."""
     turn = _turn()
+    audience = str(turn.get("audience") or getattr(_ACTIVE_ADAPTER, "_bridge_audience", "") or "")
     if not turn:
-        # Ngoài lượt chat (cron, thông báo của gateway) không có người gửi nào.
-        # Sidecar cho vai trò này gửi văn bản / báo đang gõ tới BẤT KỲ hội
-        # thoại nào, không được làm gì khác.
         return {
             "actorUid": "",
             "actorRole": "system",
             "sourceThreadId": "",
             "sourceThreadType": THREAD_USER,
             "confirmed": False,
+            "audience": audience,
+            "bridgeVerified": False,
         }
     auth = {
         "actorUid": str(turn.get("sender_uid") or ""),
@@ -127,11 +134,12 @@ def current_authorization(*, confirmed: bool = False) -> Dict[str, Any]:
         "sourceThreadId": str(turn.get("thread_id") or ""),
         "sourceThreadType": THREAD_GROUP if turn.get("is_group") else THREAD_USER,
         "confirmed": bool(confirmed),
+        "audience": audience,
+        "bridgeVerified": bool(turn.get("bridge_verified")),
     }
     if turn.get("cron_job_id"):
         auth["cronJobId"] = str(turn["cron_job_id"])
     return auth
-
 
 def _current_thread() -> Optional[str]:
     return _turn().get("thread_id")
@@ -373,14 +381,21 @@ async def _invoke(method: str, args: List[Any]) -> str:
 #  Nhóm 1 — Gửi nội dung phong phú
 # =====================================================================
 
+
+def _guest_file_egress_allowed() -> bool:
+    turn = _turn()
+    return turn.get("audience") != "guest" or bool(turn.get("bridge_verified"))
+
+
 async def zalo_send_file(args: Dict[str, Any], **_kw) -> str:
+    if not _guest_file_egress_allowed():
+        return _err("không thể gửi tệp từ lượt chưa xác thực")
     paths = args.get("paths") or ([args["path"]] if args.get("path") else [])
     if not paths:
         return _err("cần `path` hoặc `paths`")
     thread_id, kind, err = _scoped_thread(args)
     if err:
         return err
-
     # Đây là công cụ công khai và nó nhận đường dẫn tệp trên máy chủ. Nếu để
     # nguyên thì bất kỳ ai trong nhóm cũng chỉ cần nhờ "gửi giúp mình tệp
     # E:\\Hermes\\.env" là bot ngoan ngoãn tải khoá API lên nhóm. Việc lọc bí
@@ -429,11 +444,9 @@ _FILE_QUOTA: Dict[str, List[float]] = {}
 
 
 async def zalo_make_file(args: Dict[str, Any], **_kw) -> str:
-    """Dựng tệp Word/PowerPoint/Excel/PDF từ nội dung bot soạn rồi gửi vào nhóm đang chat.
-
-    Người trong nhóm không có công cụ ghi tệp hay chạy lệnh, nên công cụ này chỉ nhận nội
-    dung (xem file_maker) và dựng trong thư mục tạm, gửi xong là xoá.
-    """
+    """Dựng tệp rồi gửi qua lượt đã được cầu Zalo xác thực."""
+    if not _guest_file_egress_allowed():
+        return _err("không thể tạo tệp từ lượt chưa xác thực")
     from . import file_maker
 
     turn = _turn() or {}
@@ -758,10 +771,16 @@ async def zalo_group_members(args: Dict[str, Any], **_kw) -> str:
 
 async def zalo_find_user(args: Dict[str, Any], **_kw) -> str:
     phone = (args.get("phone") or "").strip()
-    username = (args.get("username") or "").strip()
+    username = args.get("username") or ""
     if phone:
         return await _invoke("findUser", [phone])
     if username:
+        if re.search(r"\s|[đĐ\u0300-\u036f]", unicodedata.normalize("NFD", username)):
+            return _err(
+                "username phải là tên đăng nhập Zalo, không phải tên hiển thị. "
+                "Để tìm UID của một người trong nhóm, dùng zalo_group_members. "
+                "Nếu có số điện thoại, truyền vào tham số phone."
+            )
         return await _invoke("findUserByUsername", [username])
     return _err("cần `phone` hoặc `username`")
 
@@ -2140,6 +2159,80 @@ async def zalo_fb_publish(args: Dict[str, Any], **_kw) -> str:
 
 
 
+def _guest_groups_path() -> Path:
+    configured = str(os.getenv("ZALO_GUEST_GROUPS_FILE") or "").strip()
+    if not configured:
+        raise ValueError("guest group source is not configured")
+    path = Path(configured)
+    if path.name != "guest-groups.json":
+        raise ValueError("guest group source is invalid")
+    return path
+
+
+def _valid_id(value: Any, label: str) -> str:
+    if (not isinstance(value, str) or not value or value != value.strip() or value == "*"
+            or any(char.isspace() or ord(char) < 32 for char in value)):
+        raise ValueError(f"{label} must be a non-empty identifier")
+    return value
+
+
+def _read_guest_groups(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("guest group source cannot be read") from exc
+    if (not isinstance(data, dict) or set(data) != {"version", "guestGroups"}
+            or data.get("version") != 1 or not isinstance(data.get("guestGroups"), list)):
+        raise ValueError("guest group source has an invalid shape")
+    groups = [_valid_id(group, "group_id") for group in data["guestGroups"]]
+    if groups != sorted(set(groups)):
+        raise ValueError("guest group source must be sorted and deduplicated")
+    return groups
+
+
+def _write_guest_groups(path: Path, groups: list[str]) -> None:
+    previous_umask = os.umask(0o077)
+    try:
+        fd, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    finally:
+        os.umask(previous_umask)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump({"version": 1, "guestGroups": groups}, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _change_guest_group(args: Dict[str, Any], grant: bool) -> str:
+    try:
+        group_id = _valid_id(args.get("group_id"), "group_id")
+        path = _guest_groups_path()
+        groups = _read_guest_groups(path)
+        if grant:
+            groups = sorted({*groups, group_id})
+        else:
+            groups = [group for group in groups if group != group_id]
+        _write_guest_groups(path, groups)
+    except (OSError, ValueError) as exc:
+        logger.warning("[zalo] guest group mutation rejected: %s", type(exc).__name__)
+        return _err("guest group scope was not changed")
+    action = "granted" if grant else "revoked"
+    return _ok({"action": action, "message": "Guest group scope updated."})
+
+
+async def zalo_grant_guest_group(args: Dict[str, Any], **_kw) -> str:
+    return _change_guest_group(args, True)
+
+
+async def zalo_revoke_guest_group(args: Dict[str, Any], **_kw) -> str:
+    return _change_guest_group(args, False)
+
 TOOLS = [
     # --- Nhóm 10: Fanpage Facebook ---
     ("zalo_fb_pages", "📘", _schema(
@@ -2373,14 +2466,14 @@ TOOLS = [
 
     ("zalo_group_members", "🧑‍🤝‍🧑", _schema(
         "zalo_group_members",
-        "Xem danh sách thành viên một nhóm, kèm tên hiển thị.",
+        "Cần thread_id (ID nhóm); trả UID kèm tên hiển thị, không nhận tên người hay UID cá nhân.",
         {"thread_id": _GROUP_ID},
         ["thread_id"],
     ), zalo_group_members, TOOLSET_PUBLIC),
 
     ("zalo_find_user", "🔍", _schema(
         "zalo_find_user",
-        "Tìm một người dùng Zalo theo số điện thoại hoặc tên đăng nhập.",
+        "Cần phone (số điện thoại) hoặc username (tên đăng nhập Zalo); không tra được bằng tên hiển thị.",
         {
             "phone": {"type": "string", "description": "Số điện thoại."},
             "username": {"type": "string", "description": "Tên đăng nhập Zalo."},
@@ -2390,7 +2483,7 @@ TOOLS = [
 
     ("zalo_user_info", "👤", _schema(
         "zalo_user_info",
-        "Xem hồ sơ một người dùng Zalo theo UID.",
+        "Cần user_id (UID Zalo); xem hồ sơ, không nhận số điện thoại, tên đăng nhập hay tên hiển thị.",
         {"user_id": _ZALO_ID},
         ["user_id"],
     ), zalo_user_info, TOOLSET_OWNER),
@@ -2400,6 +2493,21 @@ TOOLS = [
         "Liệt kê danh bạ bạn bè Zalo.",
         {}, [],
     ), zalo_list_friends, TOOLSET_OWNER),
+
+
+    ("zalo_grant_guest_group", "➕", _schema(
+        "zalo_grant_guest_group",
+        "Cho phép khách dùng bot trong một nhóm Zalo.",
+        {"group_id": _GROUP_ID},
+        ["group_id"],
+    ), zalo_grant_guest_group, TOOLSET_OWNER),
+
+    ("zalo_revoke_guest_group", "➖", _schema(
+        "zalo_revoke_guest_group",
+        "Thu quyền dùng bot của khách trong một nhóm Zalo.",
+        {"group_id": _GROUP_ID},
+        ["group_id"],
+    ), zalo_revoke_guest_group, TOOLSET_OWNER),
 
     # --- Nhóm 3: tính năng riêng của Zalo ---
     ("zalo_create_poll", "🗳️", _schema(
@@ -2778,7 +2886,9 @@ for _name, _emoji, _tool_schema, _handler, _toolset in TOOLS:
 # viên cùng nằm trong ngữ cảnh một phiên — ai đó thả vào nhóm một đoạn chữ soạn
 # sẵn là có thể lái mô hình mà chủ nhân không hề biết. Nhắn riêng thì ngữ cảnh
 # chỉ có lời chủ nhân.
-DM_ONLY_TOOLS = frozenset({"zalo_fb_draft", "zalo_fb_publish"})
+DM_ONLY_TOOLS = frozenset({
+    "zalo_fb_draft", "zalo_fb_publish", "zalo_grant_guest_group", "zalo_revoke_guest_group",
+})
 
 
 def _confirmation_required(tool_name: str, args: Dict[str, Any]) -> bool:
@@ -2879,10 +2989,12 @@ def _confirmed_action(handler, tool_name: str):
 def _dm_only(handler, tool_name: str):
     async def guarded(args: Dict[str, Any], **kw) -> str:
         turn = _turn()
-        if turn and turn.get("is_group"):
+        if not turn or not str(turn.get("sender_uid") or "") or "is_group" not in turn:
+            logger.warning("[zalo] direct-message context unavailable for %s", tool_name)
+            return _err("trusted direct-message context is unavailable; lifecycle state was not changed")
+        if turn["is_group"]:
             logger.info("[zalo] chặn %s — chỉ dùng được khi nhắn riêng", tool_name)
-            return _err("việc này chỉ làm được khi nhắn riêng với mình, "
-                        "không làm trong nhóm")
+            return _err("việc này chỉ làm được khi nhắn riêng với mình, không làm trong nhóm")
         return await handler(args, **kw)
 
     guarded.__name__ = getattr(handler, "__name__", tool_name)
@@ -2903,8 +3015,7 @@ def _owner_only(handler, tool_name: str):
     async def guarded(args: Dict[str, Any], **kw) -> str:
         turn = _turn()
         if not turn.get("is_owner"):
-            logger.info("[zalo] chặn %s — %s không phải chủ nhân",
-                        tool_name, turn.get("sender_uid"))
+            logger.info("[zalo] owner tool rejected: %s", tool_name)
             return _err("công cụ này chỉ chủ nhân dùng được")
         return await handler(args, **kw)
 
@@ -2912,8 +3023,15 @@ def _owner_only(handler, tool_name: str):
     guarded.__doc__ = getattr(handler, "__doc__", None)
     return guarded
 
-
 _PUBLIC_TOOL_NAMES = frozenset(name for name, _e, _s, _h, toolset in TOOLS if toolset == TOOLSET_PUBLIC)
+
+# Zalo never exposes generic Hermes mutation or execution primitives. Native,
+# narrowly authorized Zalo tools remain governed by their own wrappers.
+ZALO_DENIED_CORE_TOOLS = frozenset({
+    "skill_manage", "terminal", "execute_code", "read_file", "write_file",
+    "search_files", "delegate_task",
+})
+
 # Hai cầu nối chỉ đọc của Tool Search. ``tool_call`` thì xét công cụ thật bên trong.
 _TOOL_SEARCH_READS = frozenset({"tool_search", "tool_describe"})
 
@@ -2957,18 +3075,27 @@ def _outsider_spoke_after(turn: Dict[str, Any]) -> bool:
     )
 
 
+def _resolved_tool_name(name: str, args: Any) -> Optional[str]:
+    """Resolve the wrapped tool name; unresolved indirection is denied by caller."""
+    if name != "tool_call":
+        return name
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        underlying, _args, error = resolve_underlying_call(args if isinstance(args, dict) else {})
+    except Exception:
+        return None
+    if error or not underlying or underlying == "tool_call":
+        return None
+    return str(underlying)
+
+
 def _member_may_call(name: str, args: Any) -> bool:
     if name in _PUBLIC_TOOL_NAMES or name in _TOOL_SEARCH_READS:
         return True
     if name == "tool_call":
-        # Lõi thường đã tháo ra công cụ thật trước khi gọi hook; phòng khi chưa.
-        try:
-            from tools.tool_search import resolve_underlying_call
-
-            underlying, _args, error = resolve_underlying_call(args if isinstance(args, dict) else {})
-        except Exception:
-            return False
-        return bool(underlying) and not error and underlying != "tool_call" and _member_may_call(underlying, {})
+        underlying = _resolved_tool_name(name, args)
+        return bool(underlying) and _member_may_call(underlying, {})
     try:
         from tools.registry import registry
 
@@ -2978,32 +3105,26 @@ def _member_may_call(name: str, args: Any) -> bool:
 
 
 def guard_member_tool_call(tool_name: str = "", args: Any = None, **_kw) -> Optional[Dict[str, str]]:
-    """Hook ``pre_tool_call``: lượt không phải của riêng chủ nhân chỉ chạy được công cụ công khai.
-
-    toolsets_for_source chỉ đưa ``zalo_public`` cho người ngoài, nhưng Hermes
-    còn "đóng băng" danh sách công cụ theo phiên (``restore_agent_tool_prefix``):
-    phiên nhóm do chủ nhân mở trước thì lượt sau của bất kỳ ai cũng được cấp lại
-    ``terminal``, ``read_file``, ``vision_analyze``… Chặn tại điểm thực thi thì
-    dù công cụ lọt vào danh sách, người ngoài gọi vẫn không chạy được. Lượt của
-    chủ nhân mà có người ngoài gọi bot chen vào cũng bị hạ về mức công khai.
-
-    Không có lượt Zalo (CLI, nền tảng khác, cron) thì để yên.
-    """
+    """Execution boundary for every Zalo turn; non-Zalo callers are untouched."""
     turn = _TURN.get()
     if not turn:
         return None
+    name = str(tool_name or "")
+    resolved = _resolved_tool_name(name, args)
+    if resolved is None or resolved in ZALO_DENIED_CORE_TOOLS:
+        logger.warning("[zalo] generic core action denied")
+        return {
+            "action": "block",
+            "message": "Hành động này không khả dụng qua Zalo.",
+        }
     if (turn.get("is_owner") or turn.get("core_tools")) and not _outsider_spoke_after(turn):
         return None
-    name = str(tool_name or "")
     if _member_may_call(name, args):
         return None
-    logger.warning("[zalo] chặn %s — lượt của %s không phải của riêng chủ nhân", name, turn.get("sender_uid"))
+    logger.warning("[zalo] chặn %s — lượt không phải của riêng chủ nhân", name)
     reason = ("lượt của chủ nhân nhưng có tin người khác chen vào"
               if turn.get("is_owner") or turn.get("core_tools")
               else "lượt này do người trong nhóm gửi")
-    # Nói luôn đường đi đúng: model chỉ nhìn thấy công cụ lõi đã bị ghim vào
-    # phiên, còn công cụ Zalo công khai thì nằm sau tool_search — bị chặn mà
-    # không được chỉ chỗ thì nó bỏ cuộc và trả lời "không tra được".
     return {
         "action": "block",
         "message": (f"Công cụ {name} chỉ dùng được trong lượt của riêng chủ nhân ({reason}). "
@@ -3024,10 +3145,9 @@ def define_platform_composite() -> None:
     vòng qua ``toolsets_for_source()``, nên bảng công việc riêng của chủ nhân
     thành đọc/ghi công khai.
 
-    Định nghĩa tường minh ở đây khiến nhánh tự sinh không chạy nữa. Vẫn lấy
-    ``_HERMES_CORE_TOOLS`` làm gốc để bám theo Hermes khi nâng cấp, chỉ trừ
-    đúng phần kanban. Chủ nhân vẫn dùng kanban qua Zalo được: adapter liệt kê
-    thẳng ``kanban`` trong override dành riêng cho họ.
+    Định nghĩa tường minh ở đây khiến nhánh tự sinh không chạy nữa. Generic
+    mutation/execution tools are removed even if a resolver fallback selects
+    ``hermes-zalo``; native Zalo tools keep their own narrow authorization.
     """
     try:
         from toolsets import (_HERMES_CORE_TOOLS, create_custom_toolset,
@@ -3038,10 +3158,11 @@ def define_platform_composite() -> None:
 
     core = set(_HERMES_CORE_TOOLS)
     private = set(resolve_toolset("kanban", include_registry=False))
+    allowed_core = core - private - ZALO_DENIED_CORE_TOOLS
     create_custom_toolset(
         name="hermes-zalo",
-        description="Công cụ lõi Hermes cho nền tảng Zalo (không gồm kanban).",
-        tools=sorted(core - private),
+        description="Công cụ lõi Hermes cho nền tảng Zalo, không gồm kanban hay generic mutation.",
+        tools=sorted(allowed_core),
         includes=[],
     )
     # Bộ nhớ đệm của resolve_toolset khoá theo registry chứ không theo
@@ -3052,8 +3173,26 @@ def define_platform_composite() -> None:
     except Exception:
         pass
 
-    logger.info("[zalo] hermes-zalo: %d công cụ (đã loại %d công cụ kanban)",
-                len(core - private), len(private))
+    logger.info("[zalo] hermes-zalo: %d công cụ sau khi loại private và generic mutation", len(allowed_core))
+
+
+def define_denied_toolset() -> None:
+    try:
+        from toolsets import create_custom_toolset
+    except ImportError as exc:
+        logger.warning("[zalo] không định nghĩa được %s: %s", TOOLSET_DENIED, exc)
+        return
+    create_custom_toolset(
+        name=TOOLSET_DENIED,
+        description="Không công cụ nào. Dành cho người không phải chủ nhân cũng không phải khách.",
+        tools=[],
+        includes=[],
+    )
+    try:
+        import toolsets as _ts
+        _ts._resolve_toolset_memo.clear()
+    except Exception:
+        pass
 
 
 def define_cron_member_toolset() -> None:
