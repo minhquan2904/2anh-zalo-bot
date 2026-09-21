@@ -594,6 +594,10 @@ class ZaloAdapter(BasePlatformAdapter):
         if isinstance(owner_only, (list, tuple, set)):
             owner_only = ",".join(str(gid) for gid in owner_only)
         self._owner_only_groups = set(_split_ids(str(owner_only or "")))
+        owner_dm_mcp_toolset = str(extra.get("owner_dm_mcp_toolset") or "").strip()
+        self._owner_dm_mcp_toolset = (
+            owner_dm_mcp_toolset if owner_dm_mcp_toolset.startswith("mcp-") else ""
+        )
         # (chat, tệp, cỡ, giờ sửa) -> (lúc gửi, kết quả), chặn một đoạn thoại đi hai lần.
         self._sent_voices: Dict[tuple, tuple] = {}
 
@@ -1504,6 +1508,7 @@ class ZaloAdapter(BasePlatformAdapter):
         Hermes core capabilities stay on the SSH/terminal control plane; a
         pre-tool execution guard also denies them if a resolver regresses.
         """
+
         uid = str(getattr(source, "user_id", "") or "")
         owner = self._bind_turn_for_source(source, uid)
         if not owner and not self._is_guest(uid):
@@ -1511,11 +1516,18 @@ class ZaloAdapter(BasePlatformAdapter):
             return [TOOLSET_DENIED]
 
         chosen = [TOOLSET_OWNER, TOOLSET_PUBLIC] if owner else [TOOLSET_PUBLIC]
+        is_group = str(getattr(source, "chat_type", "") or "") == "group"
+        turn = self._turns.get(str(getattr(source, "message_id", "") or ""))
+        if (owner and not is_group and self._owner_dm_mcp_toolset
+                and turn and turn.get("is_owner")):
+            chosen.append(self._owner_dm_mcp_toolset)
 
         logger.debug("[zalo] %s (%s) → %s",
                      "chủ nhân" if owner else "người trong nhóm",
                      uid, chosen)
         return chosen
+
+
 
     def _bind_turn_for_source(self, source, uid: str) -> bool:
         """Gắn danh tính đúng của lượt này trước khi agent chạy.

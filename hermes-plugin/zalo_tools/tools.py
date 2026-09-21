@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1907,6 +1908,106 @@ async def zalo_group_cron(args: Dict[str, Any], **_kw) -> str:
         return _group_cron_remove(args, turn)
     return _err("`action` phải là create, list hoặc remove")
 
+VIDEO_ROOT = Path("/opt/data/video-jobs")
+VIDEO_WORKER = "/opt/hermes-video-worker/video_worker.py"
+VIDEO_ID = re.compile(r"^[a-f0-9]{32}$")
+VIDEO_TASKS: Dict[str, Dict[str, Any]] = {}
+VIDEO_DELIVERED: set[str] = set()
+
+
+def _video_turn() -> Optional[Dict[str, Any]]:
+    turn = _turn()
+    return turn if (turn and turn.get("is_owner") and not turn.get("is_group")
+                    and turn.get("sender_uid") and turn.get("thread_id")) else None
+
+
+def _video_dir(job_id: Any) -> Path:
+    if not isinstance(job_id, str) or not VIDEO_ID.fullmatch(job_id):
+        raise ValueError("invalid video job")
+    root = VIDEO_ROOT.resolve()
+    path = (root / job_id).resolve()
+    if path.parent != root:
+        raise ValueError("invalid video job")
+    return path
+
+
+async def zalo_create_video(args: Dict[str, Any], **_kw) -> str:
+    turn = _video_turn()
+    if not turn:
+        return _err("không thể xử lý yêu cầu video này")
+    allowed = {"title", "script", "aspect_ratio", "duration_seconds"}
+    if (not {"title", "script"}.issubset(args) or set(args) - allowed
+            or args.get("aspect_ratio", "9:16") not in {"9:16", "1:1", "16:9"}
+            or isinstance(args.get("duration_seconds", 30), bool)
+            or not isinstance(args.get("duration_seconds", 30), int)
+            or not 5 <= args.get("duration_seconds", 30) <= 60):
+        return _err("không thể xử lý yêu cầu video này")
+    if any(not isinstance(args.get(key), str) or not args[key] or args[key] != args[key].strip()
+           or len(args[key]) > maximum or re.search(r"(?:https?|file)://|[\\/;&|`$<>\[\]{}()]", args[key], re.I)
+           for key, maximum in (("title", 120), ("script", 4000))):
+        return _err("không thể xử lý yêu cầu video này")
+    owner = str(turn["sender_uid"])
+    if any(item["owner_uid"] == owner for item in VIDEO_TASKS.values()):
+        return _err("đã có video đang xử lý")
+    request = {
+        "job_id": secrets.token_hex(16),
+        "owner_uid": owner,
+        "thread_id": str(turn["thread_id"]),
+        "title": args["title"],
+        "script": args["script"],
+        "aspect_ratio": args.get("aspect_ratio", "9:16"),
+        "duration_seconds": args.get("duration_seconds", 30),
+    }
+    task = asyncio.create_task(asyncio.to_thread(
+        subprocess.run,
+        ["/usr/bin/python3", VIDEO_WORKER],
+        input=json.dumps(request, ensure_ascii=False),
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=330,
+        check=False,
+    ))
+    VIDEO_TASKS[request["job_id"]] = {"owner_uid": owner, "task": task}
+    task.add_done_callback(lambda _task, job_id=request["job_id"]: VIDEO_TASKS.pop(job_id, None))
+    return _ok({"job_id": request["job_id"], "state": "queued", "progress": 0})
+
+
+async def zalo_video_status(args: Dict[str, Any], **_kw) -> str:
+    turn = _video_turn()
+    if not turn:
+        return _err("không thể xử lý yêu cầu video này")
+    try:
+        status = json.loads((_video_dir(args.get("job_id")) / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _err("không thể xử lý yêu cầu video này")
+    if (not isinstance(status, dict) or status.get("job_id") != args.get("job_id")
+            or status.get("owner_uid") != str(turn["sender_uid"])
+            or status.get("thread_id") != str(turn["thread_id"])):
+        return _err("không thể xử lý yêu cầu video này")
+    result = {
+        "job_id": status.get("job_id"),
+        "state": status.get("state"),
+        "progress": status.get("progress"),
+    }
+    if status.get("state") == "completed" and status.get("job_id") not in VIDEO_DELIVERED:
+        try:
+            video = _video_dir(status["job_id"]) / "video.mp4"
+            if not video.is_file() or video.is_symlink():
+                raise ValueError("missing video")
+            sent = json.loads(await _invoke("sendMessage", [
+                {"msg": "Video đã hoàn tất.", "attachments": [str(video)]},
+                status["thread_id"],
+                THREAD_USER,
+            ]))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return _err("không thể xử lý yêu cầu video này")
+        if sent.get("success"):
+            VIDEO_DELIVERED.add(status["job_id"])
+            result["delivery"] = "sent"
+    if status.get("state") == "failed":
+        result["error"] = "video generation failed"
+    return _ok(result)
 
 # =====================================================================
 #  Khai báo công cụ
@@ -2851,6 +2952,23 @@ TOOLS = [
         {"user_id": _ZALO_ID},
         ["user_id"],
     ), zalo_forget_person, TOOLSET_OWNER),
+    ("zalo_create_video", "🎬", _schema(
+        "zalo_create_video",
+        "Tạo video trong DM chủ nhân. Viết title và toàn bộ narration tiếng Việt; ratio mặc định 9:16, duration mặc định 30 giây.",
+        {
+            "title": {"type": "string", "maxLength": 120},
+            "script": {"type": "string", "maxLength": 4000},
+            "aspect_ratio": {"type": "string", "enum": ["9:16", "1:1", "16:9"], "default": "9:16"},
+            "duration_seconds": {"type": "integer", "minimum": 5, "maximum": 60, "default": 30},
+        },
+        ["title", "script"],
+    ), zalo_create_video, TOOLSET_OWNER),
+    ("zalo_video_status", "🎞️", _schema(
+        "zalo_video_status",
+        "Xem tiến trình video trong DM đã tạo.",
+        {"job_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"}},
+        ["job_id"],
+    ), zalo_video_status, TOOLSET_OWNER),
 ]
 
 
@@ -2888,6 +3006,7 @@ for _name, _emoji, _tool_schema, _handler, _toolset in TOOLS:
 # chỉ có lời chủ nhân.
 DM_ONLY_TOOLS = frozenset({
     "zalo_fb_draft", "zalo_fb_publish", "zalo_grant_guest_group", "zalo_revoke_guest_group",
+    "zalo_create_video", "zalo_video_status",
 })
 
 
@@ -3096,13 +3215,16 @@ def _member_may_call(name: str, args: Any) -> bool:
     if name == "tool_call":
         underlying = _resolved_tool_name(name, args)
         return bool(underlying) and _member_may_call(underlying, {})
+    return False
+
+
+def _is_mcp_tool(name: str) -> Optional[bool]:
     try:
         from tools.registry import registry
 
         return str(registry.get_toolset_for_tool(name) or "").startswith("mcp-")
     except Exception:
-        return False
-
+        return None
 
 def guard_member_tool_call(tool_name: str = "", args: Any = None, **_kw) -> Optional[Dict[str, str]]:
     """Execution boundary for every Zalo turn; non-Zalo callers are untouched."""
@@ -3111,13 +3233,40 @@ def guard_member_tool_call(tool_name: str = "", args: Any = None, **_kw) -> Opti
         return None
     name = str(tool_name or "")
     resolved = _resolved_tool_name(name, args)
-    if resolved is None or resolved in ZALO_DENIED_CORE_TOOLS:
+    owner_dm = bool(turn.get("is_owner") and not turn.get("is_group") and not _outsider_spoke_after(turn))
+    if resolved is None:
+        # The progressive tool bridge validates its own payload before dispatch. Let
+        # an owner DM reach that validator so malformed calls get its actionable
+        # schema error; non-owner and group turns remain fail-closed.
+        if name == "tool_call" and owner_dm:
+            return None
         logger.warning("[zalo] generic core action denied")
         return {
             "action": "block",
             "message": "Hành động này không khả dụng qua Zalo.",
         }
-    if (turn.get("is_owner") or turn.get("core_tools")) and not _outsider_spoke_after(turn):
+    if resolved in ZALO_DENIED_CORE_TOOLS:
+        logger.warning("[zalo] generic core action denied")
+        return {
+            "action": "block",
+            "message": "Hành động này không khả dụng qua Zalo.",
+        }
+    mcp_tool = _is_mcp_tool(resolved)
+    if mcp_tool is None:
+        logger.warning("[zalo] cannot classify tool while enforcing MCP boundary: %s", resolved)
+        return {
+            "action": "block",
+            "message": "Hành động này không khả dụng qua Zalo.",
+        }
+    if mcp_tool:
+        if owner_dm:
+            return None
+        logger.warning("[zalo] MCP tool denied outside owner direct message: %s", resolved)
+        return {
+            "action": "block",
+            "message": "MCP chỉ khả dụng trong tin nhắn riêng của chủ nhân.",
+        }
+    if owner_dm:
         return None
     if _member_may_call(name, args):
         return None
